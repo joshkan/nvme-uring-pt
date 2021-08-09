@@ -1,0 +1,80 @@
+From b01827cdff4cad9f53460ff8fe36b277f4f44824 Mon Sep 17 00:00:00 2001
+From: Kanchan Joshi <joshi.k@samsung.com>
+Date: Thu, 5 Aug 2021 14:20:11 +0530
+Subject: [RFC PATCH 0/6] Fixed-buffers io_uring passthrough over nvme-char
+
+Hi,
+
+This series takes a dig at expanding io_uring passthrough to have
+fixed-buffer support.
+For the NVMe side plumbing, it uses the per-namespace char-device as
+the backend.
+
+The work is on top of  Jens' branch (which is 5.14-rc1 based):
+https://git.kernel.dk/cgit/linux-block/log/?h=io_uring-fops.v5
+
+Testing is done by integrating user-space side with fio:
+https://github.com/joshkan/fio/commit/a8f40d4f7013ccd38fc51275d8b00fb4ce2404f5
+
+Patches can be grouped into two parts -
+First part (patch 1 and 2) involves extending 'io_uring cmd' infra
+(for ioctl updates in task-context), and wire up nvme-passthrough on
+char-device (/dev/ngXnY).
+The second part (patch 4, 5, 6) introduces fixed-buffer variant of
+uring-cmd (IORING_OP_URING_CMD_FIXED), and new NVMe passthrough IOCTLs
+that operate on pre-registered buffers.
+
+The buffers are registered with io_uring in the usual fashion. And the
+buffer index is passed in command-SQE.
+This to be used along with two new fixed-buffer ioctl opcodes:
+NVME_IOCTL_IO_CMD_FIXED or NVME_IOCTL_IO64_CMD_FIXED.
+For existing passthrough ioctl, nvme-driver maps the buffers in I/O
+path for each command.
+For the new ioctl, driver supplies buffer-index to io_uring and gets
+to reuse pre-mapped buffers.
+
+If introducing new ioctls in nvme (for fixed-buffer) does not sound
+great, another option would be to use 'user flags' in the passthrough
+command.
+I look forward to the thoughts of the community on this.
+
+Jens,
+
+Command-SQE didn't have the field for buf_index. I'm torn among few
+options, but repurposed len for now. Please take a look.
+
+I'd appreciate the feedback/comments.
+
+
+Thanks,
+
+Changes from v4:
+https://lore.kernel.org/linux-nvme/20210325170540.59619-1-joshi.k@samsung.com/
+1. Moved to v5 branch of Jens, adapted to task-work changes in io_uring
+2. Removed support for block-passthrough (over nvme0n1) for now
+3. Added support for char-passthrough (over ng0n1)
+4. Added fixed-buffer passthrough in io_uring and nvme plumbing
+
+Anuj Gupta (2):
+  io_uring: mark iopoll not supported for uring-cmd
+  io_uring: add support for uring_cmd with fixed-buffer
+
+Kanchan Joshi (4):
+  io_uring: add infra for uring_cmd completion in submitter-task.
+  nvme: wire-up support for async-passthru on char-device.
+  io_uring: add helper for fixed-buffer uring-cmd
+  nvme: enable passthrough with fixed-buffer
+
+ drivers/nvme/host/core.c        |   1 +
+ drivers/nvme/host/ioctl.c       | 245 +++++++++++++++++++++++++++++---
+ drivers/nvme/host/multipath.c   |   1 +
+ drivers/nvme/host/nvme.h        |   5 +
+ fs/io_uring.c                   |  69 ++++++++-
+ include/linux/io_uring.h        |  15 ++
+ include/uapi/linux/io_uring.h   |   6 +-
+ include/uapi/linux/nvme_ioctl.h |   2 +
+ 8 files changed, 319 insertions(+), 25 deletions(-)
+
+-- 
+2.25.1
+
