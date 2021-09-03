@@ -1,0 +1,31 @@
+From bb0cc13a6b72e2f31d5694e9832e5ef7758b12ea Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Mon, 30 Aug 2021 18:36:37 +0530
+Subject: [PATCH 4/9] io_uring: modify unused field in io_uring_cmd to store
+ flags
+
+This patch modifies the unused field in io_uring_cmd structure to store
+the flags. This is a prep patch for providing fixedbufs and polling
+support via passthrough ioctls.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ include/linux/io_uring.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
+index 235d1603f97e..a04911c29ab4 100644
+--- a/include/linux/io_uring.h
++++ b/include/linux/io_uring.h
+@@ -12,7 +12,7 @@
+ struct io_uring_cmd {
+ 	struct file	*file;
+ 	__u16		op;
+-	__u16		unused;
++	__u16		flags;
+ 	__u32		len;
+ 	/* used if driver requires update in task context*/
+ 	void (*driver_cb)(struct io_uring_cmd *cmd);
+-- 
+2.25.1
+

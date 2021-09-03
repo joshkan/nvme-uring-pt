@@ -1,0 +1,249 @@
+From c24f38151088af02b0669ef4e3bba891fde72be5 Mon Sep 17 00:00:00 2001
+From: Pankaj Raghav <p.raghav@samsung.com>
+Date: Fri, 27 Aug 2021 13:15:42 +0530
+Subject: [PATCH 9/9] Completed Async polling work.
+
+Introduced nvme_iopoll in nvme/host/ioctl as uring poll callback -
+Using the unused field as polling identification flag from struct
+uring_cmd - Introduced a union for cookie to uniquely identify a
+blk request. - Prelimnary tests done on HW.
+
+Signed-off-by: Pankaj Raghav <p.raghav@samsung.com>
+---
+ block/blk-exec.c          |  3 ++-
+ drivers/nvme/host/core.c  |  1 +
+ drivers/nvme/host/ioctl.c | 27 ++++++++++++++++++++++----
+ drivers/nvme/host/nvme.h  |  3 +++
+ fs/io_uring.c             | 41 ++++++++++++++++++++++++++++++++++-----
+ include/linux/blkdev.h    |  1 +
+ include/linux/io_uring.h  |  9 +++++++--
+ 7 files changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index d6cd501c0d34..957faea42145 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -63,10 +63,11 @@ void blk_execute_rq_nowait(struct gendisk *bd_disk, struct request *rq,
+ }
+ EXPORT_SYMBOL_GPL(blk_execute_rq_nowait);
+ 
+-static bool blk_rq_is_poll(struct request *rq)
++bool blk_rq_is_poll(struct request *rq)
+ {
+ 	return rq->mq_hctx && rq->mq_hctx->type == HCTX_TYPE_POLL;
+ }
++EXPORT_SYMBOL_GPL(blk_rq_is_poll);
+ 
+ static void blk_rq_poll_completion(struct request *rq, struct completion *wait)
+ {
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index f512ed76312b..fd2d03cb051c 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -3562,6 +3562,7 @@ static const struct file_operations nvme_ns_chr_fops = {
+ 	.unlocked_ioctl	= nvme_ns_chr_ioctl,
+ 	.compat_ioctl	= compat_ptr_ioctl,
+ 	.uring_cmd	= nvme_ns_chr_async_ioctl,
++	.iopoll = nvme_iopoll,
+ };
+ 
+ static int nvme_add_ns_cdev(struct nvme_ns *ns)
+diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
+index 134bbdd2067a..b22cba6f5e1a 100644
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -84,8 +84,12 @@ static void nvme_end_async_pt(struct request *req, blk_status_t err)
+ 		ucd->status = nvme_req(req)->status;
+ 	ucd->result = le64_to_cpu(nvme_req(req)->result.u64);
+ 
+-	/* this takes care of setting up task-work */
+-	io_uring_cmd_complete_in_task(ioucmd, nvme_pt_task_cb);
++	if (ioucmd->flags & URING_CMD_POLLED)
++		nvme_pt_task_cb(ioucmd);
++	else {
++		/* this takes care of setting up task-work */
++		io_uring_cmd_complete_in_task(ioucmd, nvme_pt_task_cb);
++	}
+ 
+ 	/* we can unmap pages, free bio and request */
+ 	blk_rq_unmap_user(bio);
+@@ -236,6 +240,8 @@ static int nvme_submit_user_cmd(struct request_queue *q,
+ 		nvme_setup_uring_cmd_data(req, ioucmd, meta, write);
+ 		blk_execute_rq_nowait(ns ? ns->disk : NULL, req, 0,
+ 					nvme_end_async_pt);
++		if ((ioucmd->flags & URING_CMD_POLLED) && blk_rq_is_poll(req))
++			ioucmd->cookie = request_to_qc_t(req->mq_hctx, req);
+ 		return 0;
+ 	}
+ 
+@@ -267,9 +273,9 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
+ 	if (copy_from_user(&io, uio, sizeof(io)))
+ 		return -EFAULT;
+ 
+-	if (io.flags & NVME_HIPRI) {
++	if (io.flags & NVME_HIPRI)
+ 		rq_flags |= REQ_HIPRI;
+-	}
++
+ 
+ 	switch (io.opcode) {
+ 	case nvme_cmd_write:
+@@ -561,6 +567,19 @@ int nvme_ns_chr_async_ioctl(struct io_uring_cmd *ioucmd,
+ 	return nvme_ns_async_ioctl(ns, ioucmd);
+ }
+ 
++int nvme_iopoll(struct kiocb *kiocb, bool wait)
++{
++	struct nvme_ns *ns = container_of(file_inode(kiocb->ki_filp)->i_cdev,
++					  struct nvme_ns, cdev);
++	struct request_queue *q;
++	int ret;
++
++	q = ns->queue;
++	ret = blk_poll(q, READ_ONCE(kiocb->ki_cookie), wait);
++
++	return ret;
++}
++
+ #ifdef CONFIG_NVME_MULTIPATH
+ static int nvme_ns_head_ctrl_ioctl(struct nvme_ns *ns, unsigned int cmd,
+ 		void __user *argp, struct nvme_ns_head *head, int srcu_idx)
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 8ec7028fbfc1..6f2bdfcfc926 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -635,6 +635,9 @@ int nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout);
+ void nvme_start_freeze(struct nvme_ctrl *ctrl);
+ 
+ #define NVME_QID_ANY -1
++
++int nvme_iopoll(struct kiocb *kiocb, bool spin);
++
+ struct request *nvme_alloc_request(struct request_queue *q,
+ 		struct nvme_command *cmd, blk_mq_req_flags_t flags,
+ 		unsigned rq_flags);
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 5269745d68cc..81264cbc2320 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2299,6 +2299,7 @@ static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
+ 	list_for_each_entry_safe(req, tmp, &ctx->iopoll_list, inflight_entry) {
+ 		struct kiocb *kiocb = &req->rw.kiocb;
+ 
++
+ 		/*
+ 		 * Move completed and retryable entries to our local lists.
+ 		 * If we find a request that requires polling, break out
+@@ -2311,7 +2312,20 @@ static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
+ 		if (!list_empty(&done))
+ 			break;
+ 
+-		ret = kiocb->ki_filp->f_op->iopoll(kiocb, spin);
++		if (req->opcode == IORING_OP_URING_CMD ||
++		    req->opcode == IORING_OP_URING_CMD_FIXED) {
++			// uring_cmd structure does not contain kiocb struct
++			struct kiocb kiocb_uring_cmd;
++
++			kiocb_uring_cmd.ki_cookie = req->uring_cmd.cookie;
++			kiocb_uring_cmd.ki_filp = req->uring_cmd.file;
++			ret = kiocb_uring_cmd.ki_filp->f_op->iopoll(
++				&kiocb_uring_cmd, spin);
++		} else {
++			ret = kiocb->ki_filp->f_op->iopoll(&req->rw.kiocb,
++							   spin);
++		}
++
+ 		if (ret < 0)
+ 			break;
+ 
+@@ -3577,6 +3591,15 @@ static int io_unlinkat(struct io_kiocb *req, unsigned int issue_flags)
+ 	return 0;
+ }
+ 
++static void io_complete_uring_cmd_iopoll(struct io_kiocb *req, long res, long res2)
++{
++
++	WRITE_ONCE(req->result, res);
++	/* order with io_iopoll_complete() checking ->result */
++	smp_wmb();
++	WRITE_ONCE(req->iopoll_completed, 1);
++}
++
+ /*
+  * Called by consumers of io_uring_cmd, if they originally returned
+  * -EIOCBQUEUED upon receiving the command.
+@@ -3587,10 +3610,15 @@ void io_uring_cmd_done(struct io_uring_cmd *cmd, ssize_t ret)
+ 
+ 	if (ret < 0)
+ 		req_set_fail(req);
+-	io_req_complete(req, ret);
++	if (req->uring_cmd.flags & URING_CMD_POLLED) {
++		// io_iopoll_complete will take care of completing the request
++		io_complete_uring_cmd_iopoll(req, ret, 0);
++	} else
++		io_req_complete(req, ret);
+ }
+ EXPORT_SYMBOL_GPL(io_uring_cmd_done);
+ 
++
+ static int io_uring_cmd_prep(struct io_kiocb *req,
+ 			     const struct io_uring_sqe *sqe)
+ {
+@@ -3601,9 +3629,12 @@ static int io_uring_cmd_prep(struct io_kiocb *req,
+ 		return -EOPNOTSUPP;
+ 
+ 	if (req->ctx->flags & IORING_SETUP_IOPOLL) {
+-		printk_once(KERN_WARNING "io_uring: iopoll not supported!\n");
+-		return -EOPNOTSUPP;
+-	}
++		req->uring_cmd.flags = URING_CMD_POLLED;
++		req->uring_cmd.cookie = BLK_QC_T_NONE;
++		req->iopoll_completed = 0;
++	} else
++		req->uring_cmd.flags = 0;
++
+ 
+ 	cmd->op = READ_ONCE(csqe->op);
+ 	if (req->opcode == IORING_OP_URING_CMD_FIXED) {
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index ae4c53b6c27a..69e85b369d4f 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -923,6 +923,7 @@ extern int blk_rq_map_user_iov(struct request_queue *, struct request *,
+ extern void blk_execute_rq_nowait(struct gendisk *,
+ 				  struct request *, int, rq_end_io_fn *);
+ 
++bool blk_rq_is_poll(struct request *rq);
+ blk_status_t blk_execute_rq(struct gendisk *bd_disk, struct request *rq,
+ 			    int at_head);
+ 
+diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
+index a1574a6db047..48944b031d63 100644
+--- a/include/linux/io_uring.h
++++ b/include/linux/io_uring.h
+@@ -6,6 +6,7 @@
+ #include <linux/xarray.h>
+ 
+ enum {
++	URING_CMD_POLLED = (1 << 0),
+ 	URING_CMD_FIXEDBUFS = (1 << 1),
+ };
+ /*
+@@ -17,8 +18,12 @@ struct io_uring_cmd {
+ 	__u16		op;
+ 	__u16		flags;
+ 	__u32		len;
+-	/* used if driver requires update in task context*/
+-	void (*driver_cb)(struct io_uring_cmd *cmd);
++	union {
++		unsigned int cookie; // Used to identify request for polling based completion
++
++		/* used if driver requires update in task context for IRQ based completion*/
++		void (*driver_cb)(struct io_uring_cmd *cmd);
++	};
+ 	__u64		pdu[5];	/* 40 bytes available inline for free use */
+ };
+ 
+-- 
+2.25.1
+

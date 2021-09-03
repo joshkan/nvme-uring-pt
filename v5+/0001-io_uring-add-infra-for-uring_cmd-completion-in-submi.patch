@@ -1,0 +1,80 @@
+From 8bf328f2d0dff248489d8459a3ade7d55e1f1a73 Mon Sep 17 00:00:00 2001
+From: Kanchan Joshi <joshi.k@samsung.com>
+Date: Wed, 4 Aug 2021 19:23:27 +0530
+Subject: [PATCH 1/9] io_uring: add infra for uring_cmd completion in
+ submitter-task.
+
+Completion of a uring_cmd ioctl may involve referencing certain
+ioctl-specific fields, requiring original submitter context.
+Export an API that driver can use for this purpose.
+The API facilitates reusing task-work infra of io_uring, while driver
+gets to implement cmd-specific handling in a callback.
+
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ fs/io_uring.c            | 16 ++++++++++++++++
+ include/linux/io_uring.h |  8 ++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 481ebd20352c..b73bc16c3e70 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2041,6 +2041,22 @@ static void io_req_task_submit(struct io_kiocb *req)
+ 	mutex_unlock(&ctx->uring_lock);
+ }
+ 
++static void io_uring_cmd_work(struct io_kiocb *req)
++{
++	req->uring_cmd.driver_cb(&req->uring_cmd);
++}
++
++void io_uring_cmd_complete_in_task(struct io_uring_cmd *ioucmd,
++			void (*driver_cb)(struct io_uring_cmd *))
++{
++	struct io_kiocb *req = container_of(ioucmd, struct io_kiocb, uring_cmd);
++
++	req->uring_cmd.driver_cb = driver_cb;
++	req->io_task_work.func = io_uring_cmd_work;
++	io_req_task_work_add(req);
++}
++EXPORT_SYMBOL_GPL(io_uring_cmd_complete_in_task);
++
+ static void io_req_task_queue_fail(struct io_kiocb *req, int ret)
+ {
+ 	req->result = ret;
+diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
+index ea20c16f9a64..235d1603f97e 100644
+--- a/include/linux/io_uring.h
++++ b/include/linux/io_uring.h
+@@ -14,11 +14,15 @@ struct io_uring_cmd {
+ 	__u16		op;
+ 	__u16		unused;
+ 	__u32		len;
++	/* used if driver requires update in task context*/
++	void (*driver_cb)(struct io_uring_cmd *cmd);
+ 	__u64		pdu[5];	/* 40 bytes available inline for free use */
+ };
+ 
+ #if defined(CONFIG_IO_URING)
+ void io_uring_cmd_done(struct io_uring_cmd *cmd, ssize_t ret);
++void io_uring_cmd_complete_in_task(struct io_uring_cmd *ioucmd,
++			void (*driver_cb)(struct io_uring_cmd *));
+ struct sock *io_uring_get_socket(struct file *file);
+ void __io_uring_cancel(struct files_struct *files);
+ void __io_uring_free(struct task_struct *tsk);
+@@ -41,6 +45,10 @@ static inline void io_uring_free(struct task_struct *tsk)
+ static inline void io_uring_cmd_done(struct io_uring_cmd *cmd, ssize_t ret)
+ {
+ }
++static inline void io_uring_cmd_complete_in_task(struct io_uring_cmd *ioucmd,
++			void (*driver_cb)(struct io_uring_cmd *))
++{
++}
+ static inline struct sock *io_uring_get_socket(struct file *file)
+ {
+ 	return NULL;
+-- 
+2.25.1
+

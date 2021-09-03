@@ -1,0 +1,32 @@
+From 0be82452bb31ff15eac61cc0ab03ffb215698102 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.@samsung.com>
+Date: Wed, 4 Aug 2021 19:26:04 +0530
+Subject: [PATCH 3/9] io_uring: mark iopoll not supported for uring-cmd
+
+Currently uring-passthrough doesn't support iopoll. Bail out to avoid
+the panic.
+
+Signed-off-by: Anuj Gupta <anuj20.@samsung.com>
+---
+ fs/io_uring.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index b73bc16c3e70..3361056313a7 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -3587,6 +3587,11 @@ static int io_uring_cmd_prep(struct io_kiocb *req,
+ 	if (!req->file->f_op->uring_cmd)
+ 		return -EOPNOTSUPP;
+ 
++	if (req->ctx->flags & IORING_SETUP_IOPOLL) {
++		printk_once(KERN_WARNING "io_uring: iopoll not supported!\n");
++		return -EOPNOTSUPP;
++	}
++
+ 	cmd->op = READ_ONCE(csqe->op);
+ 	cmd->len = READ_ONCE(csqe->len);
+ 
+-- 
+2.25.1
+

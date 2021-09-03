@@ -1,0 +1,95 @@
+From 61aa1487061ad52ee0558af1955e6d6f30ba98b4 Mon Sep 17 00:00:00 2001
+From: Kanchan Joshi <joshi.k@samsung.com>
+Date: Wed, 4 Aug 2021 19:27:49 +0530
+Subject: [PATCH 5/9] io_uring: add flag and helper for fixed-buffer uring-cmd
+
+Add URING_CMD_FIXEDBUFS flag to use fixedbufs enabled passthrough.
+Refactor the existing code and factor out helper that can be used for
+passthrough with fixed-buffer. This is a prep patch.
+
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ fs/io_uring.c            | 21 +++++++++++++++------
+ include/linux/io_uring.h | 10 ++++++++++
+ 2 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 3361056313a7..1f2263a78c8e 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2792,12 +2792,10 @@ static void kiocb_done(struct kiocb *kiocb, ssize_t ret,
+ 		}
+ 	}
+ }
+-
+-static int __io_import_fixed(struct io_kiocb *req, int rw, struct iov_iter *iter,
+-			     struct io_mapped_ubuf *imu)
++static int __io_import_fixed(u64 buf_addr, size_t len, int rw,
++			struct iov_iter *iter, struct io_mapped_ubuf *imu)
+ {
+-	size_t len = req->rw.len;
+-	u64 buf_end, buf_addr = req->rw.addr;
++	u64 buf_end;
+ 	size_t offset;
+ 
+ 	if (unlikely(check_add_overflow(buf_addr, (u64)len, &buf_end)))
+@@ -2864,8 +2862,19 @@ static int io_import_fixed(struct io_kiocb *req, int rw, struct iov_iter *iter)
+ 		imu = READ_ONCE(ctx->user_bufs[index]);
+ 		req->imu = imu;
+ 	}
+-	return __io_import_fixed(req, rw, iter, imu);
++	return __io_import_fixed(req->rw.addr, req->rw.len, rw, iter, imu);
++}
++
++int io_uring_cmd_import_fixed(void *ubuf, unsigned long len,
++		int rw, struct iov_iter *iter, void *ioucmd)
++{
++	u64 buf_addr = (u64)ubuf;
++	struct io_kiocb *req = container_of(ioucmd, struct io_kiocb, uring_cmd);
++	struct io_mapped_ubuf *imu = req->imu;
++
++	return __io_import_fixed(buf_addr, len, rw, iter, imu);
+ }
++EXPORT_SYMBOL_GPL(io_uring_cmd_import_fixed);
+ 
+ static void io_ring_submit_unlock(struct io_ring_ctx *ctx, bool needs_lock)
+ {
+diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
+index a04911c29ab4..a1574a6db047 100644
+--- a/include/linux/io_uring.h
++++ b/include/linux/io_uring.h
+@@ -5,6 +5,9 @@
+ #include <linux/sched.h>
+ #include <linux/xarray.h>
+ 
++enum {
++	URING_CMD_FIXEDBUFS = (1 << 1),
++};
+ /*
+  * Note that the first member here must be a struct file, as the
+  * io_uring command layout depends on that.
+@@ -20,6 +23,8 @@ struct io_uring_cmd {
+ };
+ 
+ #if defined(CONFIG_IO_URING)
++int io_uring_cmd_import_fixed(void *ubuf, unsigned long len,
++		int rw, struct iov_iter *iter, void *ioucmd);
+ void io_uring_cmd_done(struct io_uring_cmd *cmd, ssize_t ret);
+ void io_uring_cmd_complete_in_task(struct io_uring_cmd *ioucmd,
+ 			void (*driver_cb)(struct io_uring_cmd *));
+@@ -49,6 +54,11 @@ static inline void io_uring_cmd_complete_in_task(struct io_uring_cmd *ioucmd,
+ 			void (*driver_cb)(struct io_uring_cmd *))
+ {
+ }
++int io_uring_cmd_import_fixed(void *ubuf, unsigned long len,
++		int rw, struct iov_iter *iter, void *ioucmd)
++{
++	return -1;
++}
+ static inline struct sock *io_uring_get_socket(struct file *file)
+ {
+ 	return NULL;
+-- 
+2.25.1
+

@@ -2,6 +2,14 @@
 
 This contains the patches sent to LKML for uring-passthrough over nvme.
 
+#v5+
+What it contains
+****************
+v6-wip revision of patchset containing:
+- async passthrough polling
+- fixed-buffer support simplified (no need of new NVMe ioctl)
+
+
 #v5
 What it contains
 ****************
