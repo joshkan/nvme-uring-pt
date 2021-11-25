@@ -1,0 +1,30 @@
+From 36629993c17e12c1f5bf3143c2f0e45edb94300b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 27 Sep 2021 13:23:51 -0600
+Subject: [PATCH v6 16/21] io_uring: plug for async bypass
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/io_uring.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 255c220df77f..057d03a83879 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -1111,10 +1111,12 @@ static const struct io_op_def io_op_defs[] = {
+ 	[IORING_OP_URING_CMD] = {
+ 		.needs_file		= 1,
+ 		.offsets		= 1,
++		.plug			= 1,
+ 	},
+ 	[IORING_OP_URING_CMD_FIXED] = {
+ 		.needs_file		= 1,
+ 		.offsets		= 1,
++		.plug			= 1,
+ 	},
+ };
+ 
+-- 
+2.25.1
+

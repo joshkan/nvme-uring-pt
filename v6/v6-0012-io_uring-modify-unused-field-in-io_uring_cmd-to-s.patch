@@ -1,12 +1,12 @@
-From bb0cc13a6b72e2f31d5694e9832e5ef7758b12ea Mon Sep 17 00:00:00 2001
+From 40aa119f34cd3140b220d9017eac2ab90f77784e Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
-Date: Mon, 30 Aug 2021 18:36:37 +0530
-Subject: [PATCH 4/9] io_uring: modify unused field in io_uring_cmd to store
- flags
+Date: Tue, 21 Sep 2021 18:47:38 +0530
+Subject: [PATCH v6 12/21] io_uring: modify unused field in io_uring_cmd to
+ store flags
 
 This patch modifies the unused field in io_uring_cmd structure to store
-the flags. This is a prep patch for providing fixedbufs and polling
-support via passthrough ioctls.
+the flags. This is a prep patch for providing fixedbufs support via
+passthrough ioctls.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
@@ -14,7 +14,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
-index 235d1603f97e..a04911c29ab4 100644
+index f4b4990a3b62..5ab824ced147 100644
 --- a/include/linux/io_uring.h
 +++ b/include/linux/io_uring.h
 @@ -12,7 +12,7 @@

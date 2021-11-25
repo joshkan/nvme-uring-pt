@@ -1,0 +1,331 @@
+From d8c80e22d8795371863af4e40bb1cee81a66a21a Mon Sep 17 00:00:00 2001
+From: Pankaj Raghav <p.raghav@samsung.com>
+Date: Tue, 26 Oct 2021 21:01:20 +0200
+Subject: [PATCH v6 21/21] nvme: Add async passthru polling support
+
+IO_URING already has polling support for read and write. This patch
+extends that support for uring cmd passthu. The unused flag in
+uring_cmd struct is used to indicate if the completion should be polled.
+If device side polling is not enabled, then the submission request will
+fallback to a non-polled request.
+
+Signed-off-by: Pankaj Raghav <p.raghav@samsung.com>
+---
+ block/blk-exec.c              |  4 +-
+ drivers/nvme/host/core.c      |  1 +
+ drivers/nvme/host/ioctl.c     | 79 ++++++++++++++++++++++++++++++++++-
+ drivers/nvme/host/multipath.c |  1 +
+ drivers/nvme/host/nvme.h      |  4 ++
+ fs/io_uring.c                 | 45 ++++++++++++++++++--
+ include/linux/blk-mq.h        |  1 +
+ include/linux/io_uring.h      | 10 ++++-
+ 8 files changed, 136 insertions(+), 9 deletions(-)
+
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index 1b8b47f6e79b..31c54aafb451 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -63,7 +63,7 @@ void blk_execute_rq_nowait(struct gendisk *bd_disk, struct request *rq,
+ }
+ EXPORT_SYMBOL_GPL(blk_execute_rq_nowait);
+ 
+-static bool blk_rq_is_poll(struct request *rq)
++bool blk_rq_is_poll(struct request *rq)
+ {
+ 	if (!rq->mq_hctx)
+ 		return false;
+@@ -73,6 +73,8 @@ static bool blk_rq_is_poll(struct request *rq)
+ 		return false;
+ 	return true;
+ }
++EXPORT_SYMBOL_GPL(blk_rq_is_poll);
++
+ 
+ static void blk_rq_poll_completion(struct request *rq, struct completion *wait)
+ {
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 4342dfb112dc..8ff29461ccd5 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -3640,6 +3640,7 @@ static const struct file_operations nvme_ns_chr_fops = {
+ 	.unlocked_ioctl	= nvme_ns_chr_ioctl,
+ 	.compat_ioctl	= compat_ptr_ioctl,
+ 	.async_cmd	= nvme_ns_chr_async_cmd,
++	.iopoll	= nvme_iopoll,
+ };
+ 
+ static int nvme_add_ns_cdev(struct nvme_ns *ns)
+diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
+index 6042e1e97178..84acfb095413 100644
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -31,6 +31,12 @@ struct nvme_uring_cmd {
+ 	void __user *meta_buffer;
+ };
+ 
++static inline bool is_polling_enabled(struct io_uring_cmd *ioucmd,
++				      struct request *req)
++{
++	return (ioucmd->flags & URING_CMD_POLLED) && blk_rq_is_poll(req);
++}
++
+ static struct nvme_uring_cmd *nvme_uring_cmd(struct io_uring_cmd *ioucmd)
+ {
+ 	return (struct nvme_uring_cmd *)&ioucmd->pdu;
+@@ -76,8 +82,16 @@ static void nvme_end_async_pt(struct request *req, blk_status_t err)
+ 
+ 	cmd->req = req;
+ 	req->bio = bio;
+-	/* this takes care of setting up task-work */
+-	io_uring_cmd_complete_in_task(ioucmd, nvme_pt_task_cb);
++
++	/*IO can be completed immediately when the callback
++	 * is in the same task context
++	 */
++	if (is_polling_enabled(ioucmd, req)) {
++		nvme_pt_task_cb(ioucmd);
++	} else {
++		/* this takes care of setting up task-work */
++		io_uring_cmd_complete_in_task(ioucmd, nvme_pt_task_cb);
++	}
+ }
+ 
+ static void nvme_setup_uring_cmd_data(struct request *rq,
+@@ -185,6 +199,12 @@ static int nvme_submit_user_cmd(struct request_queue *q,
+ 	if (ioucmd) { /* async dispatch */
+ 		nvme_setup_uring_cmd_data(req, ioucmd, meta, meta_buffer,
+ 				meta_len, write);
++
++		if (bio && is_polling_enabled(ioucmd, req)) {
++			ioucmd->bio = bio;
++			bio->bi_opf |= REQ_POLLED;
++		}
++
+ 		blk_execute_rq_nowait(ns ? ns->disk : NULL, req, 0,
+ 					nvme_end_async_pt);
+ 		return 0;
+@@ -497,6 +517,32 @@ int nvme_ns_chr_async_cmd(struct io_uring_cmd *ioucmd,
+ 	return nvme_ns_async_ioctl(ns, ioucmd);
+ }
+ 
++int nvme_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
++		unsigned int flags)
++{
++	struct bio *bio = NULL;
++	struct nvme_ns *ns = NULL;
++	struct request_queue *q = NULL;
++	int ret = 0;
++
++	rcu_read_lock();
++	bio = READ_ONCE(kiocb->private);
++	ns = container_of(file_inode(kiocb->ki_filp)->i_cdev, struct nvme_ns,
++			  cdev);
++	q = ns->queue;
++
++	/* bio and driver_cb are a part of the same union type in io_uring_cmd
++	 * struct. When there are no poll queues, driver_cb is used for IRQ cb
++	 * but polling is performed from the io_uring side. To avoid unnecessary
++	 * polling, a check is added to see if it is a polled queue and return 0
++	 * if it is not.
++	 */
++	if ((test_bit(QUEUE_FLAG_POLL, &q->queue_flags)) && bio && bio->bi_bdev)
++		ret = bio_poll(bio, iob, flags);
++	rcu_read_unlock();
++	return ret;
++}
++
+ #ifdef CONFIG_NVME_MULTIPATH
+ static int nvme_ns_head_ctrl_ioctl(struct nvme_ns *ns, unsigned int cmd,
+ 		void __user *argp, struct nvme_ns_head *head, int srcu_idx)
+@@ -578,6 +624,35 @@ long nvme_ns_head_chr_ioctl(struct file *file, unsigned int cmd,
+ 	srcu_read_unlock(&head->srcu, srcu_idx);
+ 	return ret;
+ }
++
++int nvme_ns_head_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
++			unsigned int flags)
++{
++	struct bio *bio = NULL;
++	struct request_queue *q = NULL;
++	struct cdev *cdev = file_inode(kiocb->ki_filp)->i_cdev;
++	struct nvme_ns_head *head = container_of(cdev, struct nvme_ns_head, cdev);
++	int srcu_idx = srcu_read_lock(&head->srcu);
++	struct nvme_ns *ns = nvme_find_path(head);
++	int ret = -EWOULDBLOCK;
++
++	if (ns) {
++		bio = READ_ONCE(kiocb->private);
++		q = ns->queue;
++	    /* bio and driver_cb are a part of the same union type in io_uring_cmd
++	     * struct. When there are no poll queues, driver_cb is used for IRQ cb
++	     * but polling is performed from the io_uring side. To avoid unnecessary
++	     * polling, a check is added to see if it is a polled queue and return 0
++	     * if it is not.
++	     */
++		if ((test_bit(QUEUE_FLAG_POLL, &q->queue_flags)) && bio &&
++		    bio->bi_bdev)
++			ret = bio_poll(bio, iob, flags);
++	}
++
++	srcu_read_unlock(&head->srcu, srcu_idx);
++	return ret;
++}
+ #endif /* CONFIG_NVME_MULTIPATH */
+ 
+ static int nvme_dev_user_cmd(struct nvme_ctrl *ctrl, void __user *argp)
+diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
+index 5b5c17dea509..387e0c874bf4 100644
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -424,6 +424,7 @@ static const struct file_operations nvme_ns_head_chr_fops = {
+ 	.unlocked_ioctl	= nvme_ns_head_chr_ioctl,
+ 	.compat_ioctl	= compat_ptr_ioctl,
+ 	.async_cmd	= nvme_ns_head_chr_async_cmd,
++	.iopoll	    = nvme_ns_head_iopoll,
+ };
+ 
+ static int nvme_add_ns_head_cdev(struct nvme_ns_head *head)
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index cc806f9d6642..13bf053a55cd 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -752,8 +752,12 @@ long nvme_dev_ioctl(struct file *file, unsigned int cmd,
+ 		unsigned long arg);
+ int nvme_ns_chr_async_cmd(struct io_uring_cmd *ucmd,
+ 		enum io_uring_cmd_flags flags);
++int nvme_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
++		unsigned int flags);
+ int nvme_ns_head_chr_async_cmd(struct io_uring_cmd *ucmd,
+ 		enum io_uring_cmd_flags flags);
++int nvme_ns_head_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
++			unsigned int flags);
+ int nvme_getgeo(struct block_device *bdev, struct hd_geometry *geo);
+ 
+ extern const struct attribute_group *nvme_ns_id_attr_groups[];
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 057d03a83879..4650f93932fa 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2518,7 +2518,20 @@ static int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin)
+ 		if (READ_ONCE(req->iopoll_completed))
+ 			break;
+ 
+-		ret = kiocb->ki_filp->f_op->iopoll(kiocb, &iob, poll_flags);
++		if (req->opcode == IORING_OP_URING_CMD ||
++		    req->opcode == IORING_OP_URING_CMD_FIXED) {
++			/* uring_cmd structure does not contain kiocb struct */
++			struct kiocb kiocb_uring_cmd;
++
++			kiocb_uring_cmd.private = req->uring_cmd.bio;
++			kiocb_uring_cmd.ki_filp = req->uring_cmd.file;
++			ret = req->uring_cmd.file->f_op->iopoll(&kiocb_uring_cmd,
++			      &iob, poll_flags);
++		} else {
++			ret = kiocb->ki_filp->f_op->iopoll(kiocb, &iob,
++							   poll_flags);
++		}
++
+ 		if (unlikely(ret < 0))
+ 			return ret;
+ 		else if (ret)
+@@ -2629,6 +2642,15 @@ static int io_iopoll_check(struct io_ring_ctx *ctx, long min)
+ 			    wq_list_empty(&ctx->iopoll_list))
+ 				break;
+ 		}
++
++		/*
++		 * In some scenarios, completion callback has been queued up to be
++		 * completed in-task context but polling happens in the same task
++		 * not giving a chance for the completion callback to complete.
++		 */
++		if (current->task_works)
++			io_run_task_work();
++
+ 		ret = io_do_iopoll(ctx, !min);
+ 		if (ret < 0)
+ 			break;
+@@ -3986,6 +4008,14 @@ static int io_linkat(struct io_kiocb *req, unsigned int issue_flags)
+ 	return 0;
+ }
+ 
++static void io_complete_uring_cmd_iopoll(struct io_kiocb *req, long res)
++{
++	WRITE_ONCE(req->result, res);
++	/* order with io_iopoll_complete() checking ->result */
++	smp_wmb();
++	WRITE_ONCE(req->iopoll_completed, 1);
++}
++
+ /*
+  * Called by consumers of io_uring_cmd, if they originally returned
+  * -EIOCBQUEUED upon receiving the command.
+@@ -3996,7 +4026,11 @@ void io_uring_cmd_done(struct io_uring_cmd *cmd, ssize_t ret)
+ 
+ 	if (ret < 0)
+ 		req_set_fail(req);
+-	io_req_complete(req, ret);
++
++	if (req->uring_cmd.flags & URING_CMD_POLLED)
++		io_complete_uring_cmd_iopoll(req, ret);
++	else
++		io_req_complete(req, ret);
+ }
+ EXPORT_SYMBOL_GPL(io_uring_cmd_done);
+ 
+@@ -4011,8 +4045,11 @@ static int io_uring_cmd_prep(struct io_kiocb *req,
+ 		return -EOPNOTSUPP;
+ 
+ 	if (req->ctx->flags & IORING_SETUP_IOPOLL) {
+-		printk_once(KERN_WARNING "io_uring: iopoll not supported!\n");
+-		return -EOPNOTSUPP;
++		req->uring_cmd.flags = URING_CMD_POLLED;
++		req->uring_cmd.bio = NULL;
++		req->iopoll_completed = 0;
++	} else {
++		req->uring_cmd.flags = 0;
+ 	}
+ 
+ 	cmd->op = READ_ONCE(csqe->op);
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 4f53eb1d31c6..0371d83463ea 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -928,6 +928,7 @@ int blk_rq_map_kern(struct request_queue *, struct request *, void *,
+ int blk_rq_append_bio(struct request *rq, struct bio *bio);
+ void blk_execute_rq_nowait(struct gendisk *, struct request *, int,
+ 		rq_end_io_fn *);
++bool blk_rq_is_poll(struct request *rq);
+ blk_status_t blk_execute_rq(struct gendisk *bd_disk, struct request *rq,
+ 		int at_head);
+ 
+diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
+index 07732bc850af..bbc9c4ea19c3 100644
+--- a/include/linux/io_uring.h
++++ b/include/linux/io_uring.h
+@@ -6,6 +6,7 @@
+ #include <linux/xarray.h>
+ 
+ enum {
++	URING_CMD_POLLED = (1 << 0),
+ 	URING_CMD_FIXEDBUFS = (1 << 1),
+ };
+ /*
+@@ -17,8 +18,13 @@ struct io_uring_cmd {
+ 	__u16		op;
+ 	__u16		flags;
+ 	__u32		len;
+-	/* used if driver requires update in task context*/
+-	void (*driver_cb)(struct io_uring_cmd *cmd);
++	union {
++		void *bio; // Used for polling based completion
++
++		/* used if driver requires update in task context for IRQ based completion*/
++		void (*driver_cb)(struct io_uring_cmd *cmd);
++	};
++
+ 	__u64		pdu[5];	/* 40 bytes available inline for free use */
+ };
+ 
+-- 
+2.25.1
+

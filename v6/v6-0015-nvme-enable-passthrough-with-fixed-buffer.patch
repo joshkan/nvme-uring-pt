@@ -1,0 +1,165 @@
+From 1f60e5eca6efa379203704fe037fb110b7ded464 Mon Sep 17 00:00:00 2001
+From: Kanchan Joshi <joshi.k@samsung.com>
+Date: Mon, 25 Oct 2021 16:43:39 +0530
+Subject: [PATCH v6 15/21] nvme: enable passthrough with fixed-buffer
+
+Add support to carry out passthrough command with pre-mapped buffers.
+
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+---
+ block/blk-map.c           | 46 +++++++++++++++++++++++++++++++++++++++
+ drivers/nvme/host/ioctl.c | 30 +++++++++++++++----------
+ include/linux/blk-mq.h    |  3 +++
+ 3 files changed, 67 insertions(+), 12 deletions(-)
+
+diff --git a/block/blk-map.c b/block/blk-map.c
+index 4526adde0156..9aa9864eab55 100644
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -8,6 +8,7 @@
+ #include <linux/bio.h>
+ #include <linux/blkdev.h>
+ #include <linux/uio.h>
++#include <linux/io_uring.h>
+ 
+ #include "blk.h"
+ 
+@@ -577,6 +578,51 @@ int blk_rq_map_user(struct request_queue *q, struct request *rq,
+ }
+ EXPORT_SYMBOL(blk_rq_map_user);
+ 
++/* Unlike blk_rq_map_user () this is only for fixed-buffer async passthrough. */
++int blk_rq_map_user_fixedb(struct request_queue *q, struct request *rq,
++		     u64 ubuf, unsigned long len, gfp_t gfp_mask,
++		     struct io_uring_cmd *ioucmd)
++{
++	struct iov_iter iter;
++	size_t iter_count, nr_segs;
++	struct bio *bio;
++	int ret;
++
++	/*
++	 * Talk to io_uring to obtain BVEC iterator for the buffer.
++	 * And use that iterator to form bio/request.
++	 */
++	ret = io_uring_cmd_import_fixed(ubuf, len, rq_data_dir(rq), &iter,
++			ioucmd);
++	if (unlikely(ret < 0))
++		return ret;
++	iter_count = iov_iter_count(&iter);
++	nr_segs = iter.nr_segs;
++
++	if (!iter_count || (iter_count >> 9) > queue_max_hw_sectors(q))
++		return -EINVAL;
++	if (nr_segs > queue_max_segments(q))
++		return -EINVAL;
++	/* no iovecs to alloc, as we already have a BVEC iterator */
++	bio = bio_alloc(gfp_mask, 0);
++	if (!bio)
++		return -ENOMEM;
++
++	bio->bi_opf |= req_op(rq);
++	ret = bio_iov_iter_get_pages(bio, &iter);
++	if (ret)
++		goto out_free;
++
++	blk_rq_bio_prep(rq, bio, nr_segs);
++	return 0;
++
++out_free:
++	bio_release_pages(bio, false);
++	bio_put(bio);
++	return ret;
++}
++EXPORT_SYMBOL(blk_rq_map_user_fixedb);
++
+ /**
+  * blk_rq_unmap_user - unmap a request with user data
+  * @bio:	       start of bio list
+diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
+index ef50f1bd205c..afeb3afe6c60 100644
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -131,8 +131,13 @@ static void *nvme_add_user_metadata(struct bio *bio, void __user *ubuf,
+ 	return ERR_PTR(ret);
+ }
+ 
++static inline bool nvme_is_fixedb_passthru(struct io_uring_cmd *ioucmd)
++{
++	return ((ioucmd) && (ioucmd->flags & URING_CMD_FIXEDBUFS));
++}
++
+ static int nvme_submit_user_cmd(struct request_queue *q,
+-		struct nvme_command *cmd, void __user *ubuffer,
++		struct nvme_command *cmd, u64 ubuffer,
+ 		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+ 		u32 meta_seed, u64 *result, unsigned timeout,
+ 		struct io_uring_cmd *ioucmd)
+@@ -154,8 +159,12 @@ static int nvme_submit_user_cmd(struct request_queue *q,
+ 	nvme_req(req)->flags |= NVME_REQ_USERCMD;
+ 
+ 	if (ubuffer && bufflen) {
+-		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
+-				GFP_KERNEL);
++		if (likely(!nvme_is_fixedb_passthru(ioucmd)))
++			ret = blk_rq_map_user(q, req, NULL, nvme_to_user_ptr(ubuffer),
++					bufflen, GFP_KERNEL);
++		else
++			ret = blk_rq_map_user_fixedb(q, req, ubuffer, bufflen,
++					GFP_KERNEL, ioucmd);
+ 		if (ret)
+ 			goto out;
+ 		bio = req->bio;
+@@ -255,9 +264,8 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
+ 	c.rw.appmask = cpu_to_le16(io.appmask);
+ 
+ 	return nvme_submit_user_cmd(ns->queue, &c,
+-			nvme_to_user_ptr(io.addr), length,
+-			metadata, meta_len, lower_32_bits(io.slba), NULL, 0,
+-			NULL);
++			io.addr, length, metadata, meta_len,
++			lower_32_bits(io.slba), NULL, 0, NULL);
+ }
+ 
+ static bool nvme_validate_passthru_nsid(struct nvme_ctrl *ctrl,
+@@ -309,9 +317,8 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 		timeout = msecs_to_jiffies(cmd.timeout_ms);
+ 
+ 	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
+-			nvme_to_user_ptr(cmd.addr), cmd.data_len,
+-			nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
+-			0, &result, timeout, NULL);
++			cmd.addr, cmd.data_len, nvme_to_user_ptr(cmd.metadata),
++			cmd.metadata_len, 0, &result, timeout, NULL);
+ 
+ 	if (status >= 0) {
+ 		if (put_user(result, &ucmd->result))
+@@ -356,9 +363,8 @@ static int nvme_user_cmd64(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 		timeout = msecs_to_jiffies(cmd.timeout_ms);
+ 
+ 	status = nvme_submit_user_cmd(ns ? ns->queue : ctrl->admin_q, &c,
+-			nvme_to_user_ptr(cmd.addr), cmd.data_len,
+-			nvme_to_user_ptr(cmd.metadata), cmd.metadata_len,
+-			0, &cmd.result, timeout, ioucmd);
++			cmd.addr, cmd.data_len, nvme_to_user_ptr(cmd.metadata),
++			cmd.metadata_len, 0, &cmd.result, timeout, ioucmd);
+ 
+ 	if (!ioucmd && status >= 0) {
+ 		if (put_user(cmd.result, &ucmd->result))
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index a826621078b4..8d7b101bb22d 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -917,6 +917,9 @@ struct rq_map_data {
+ 
+ int blk_rq_map_user(struct request_queue *, struct request *,
+ 		struct rq_map_data *, void __user *, unsigned long, gfp_t);
++int blk_rq_map_user_fixedb(struct request_queue *, struct request *,
++		     u64 ubuf, unsigned long, gfp_t,
++		     struct io_uring_cmd *);
+ int blk_rq_map_user_iov(struct request_queue *, struct request *,
+ 		struct rq_map_data *, const struct iov_iter *, gfp_t);
+ int blk_rq_unmap_user(struct bio *);
+-- 
+2.25.1
+

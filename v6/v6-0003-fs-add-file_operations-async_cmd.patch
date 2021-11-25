@@ -1,0 +1,65 @@
+From 12456c493e7b58a17e0d49ec50ef5ea9ec0cbd6f Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 25 Oct 2021 13:17:49 +0530
+Subject: [PATCH v6 03/21] fs: add file_operations->async_cmd()
+
+This is a file private handler, similar to ioctls but hopefully a lot
+more sane and useful.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/io_uring.c      |  7 -------
+ include/linux/fs.h | 12 ++++++++++++
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 0fe7a9fc9fa0..213f0daa964d 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -199,13 +199,6 @@ struct io_rings {
+ 	struct io_uring_cqe	cqes[] ____cacheline_aligned_in_smp;
+ };
+ 
+-enum io_uring_cmd_flags {
+-	IO_URING_F_COMPLETE_DEFER	= 1,
+-	IO_URING_F_UNLOCKED		= 2,
+-	/* int's last bit, sign checks are usually faster than a bit test */
+-	IO_URING_F_NONBLOCK		= INT_MIN,
+-};
+-
+ struct io_mapped_ubuf {
+ 	u64		ubuf;
+ 	u64		ubuf_end;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 3afca821df32..94a5b640b9ed 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2065,6 +2065,17 @@ struct dir_context {
+ #define REMAP_FILE_ADVISORY		(REMAP_FILE_CAN_SHORTEN)
+ 
+ struct iov_iter;
++struct io_uring_cmd;
++
++/*
++ * f_op->async_cmd() issue flags
++ */
++enum io_uring_cmd_flags {
++	IO_URING_F_COMPLETE_DEFER	= 1,
++	IO_URING_F_UNLOCKED		= 2,
++	/* int's last bit, sign checks are usually faster than a bit test */
++	IO_URING_F_NONBLOCK		= INT_MIN,
++};
+ 
+ struct file_operations {
+ 	struct module *owner;
+@@ -2107,6 +2118,7 @@ struct file_operations {
+ 				   struct file *file_out, loff_t pos_out,
+ 				   loff_t len, unsigned int remap_flags);
+ 	int (*fadvise)(struct file *, loff_t, loff_t, int);
++	int (*async_cmd)(struct io_uring_cmd *, enum io_uring_cmd_flags);
+ } __randomize_layout;
+ 
+ struct inode_operations {
+-- 
+2.25.1
+

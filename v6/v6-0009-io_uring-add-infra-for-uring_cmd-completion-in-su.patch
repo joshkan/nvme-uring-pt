@@ -1,8 +1,8 @@
-From 8bf328f2d0dff248489d8459a3ade7d55e1f1a73 Mon Sep 17 00:00:00 2001
+From 988f079051b7980df1dac66b206671ed239127c4 Mon Sep 17 00:00:00 2001
 From: Kanchan Joshi <joshi.k@samsung.com>
-Date: Wed, 4 Aug 2021 19:23:27 +0530
-Subject: [PATCH 1/9] io_uring: add infra for uring_cmd completion in
- submitter-task.
+Date: Tue, 21 Sep 2021 18:24:55 +0530
+Subject: [PATCH v6 09/21] io_uring: add infra for uring_cmd completion in
+ submitter-task
 
 Completion of a uring_cmd ioctl may involve referencing certain
 ioctl-specific fields, requiring original submitter context.
@@ -18,14 +18,14 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  2 files changed, 24 insertions(+)
 
 diff --git a/fs/io_uring.c b/fs/io_uring.c
-index 481ebd20352c..b73bc16c3e70 100644
+index ecd35e1d7dcf..c24264297365 100644
 --- a/fs/io_uring.c
 +++ b/fs/io_uring.c
-@@ -2041,6 +2041,22 @@ static void io_req_task_submit(struct io_kiocb *req)
- 	mutex_unlock(&ctx->uring_lock);
+@@ -2300,6 +2300,22 @@ static void io_req_task_submit(struct io_kiocb *req, bool *locked)
+ 		io_req_complete_failed(req, -EFAULT);
  }
  
-+static void io_uring_cmd_work(struct io_kiocb *req)
++static void io_uring_cmd_work(struct io_kiocb *req, bool *locked)
 +{
 +	req->uring_cmd.driver_cb(&req->uring_cmd);
 +}
@@ -45,7 +45,7 @@ index 481ebd20352c..b73bc16c3e70 100644
  {
  	req->result = ret;
 diff --git a/include/linux/io_uring.h b/include/linux/io_uring.h
-index ea20c16f9a64..235d1603f97e 100644
+index 64e788b39a86..f4b4990a3b62 100644
 --- a/include/linux/io_uring.h
 +++ b/include/linux/io_uring.h
 @@ -14,11 +14,15 @@ struct io_uring_cmd {
@@ -62,9 +62,9 @@ index ea20c16f9a64..235d1603f97e 100644
 +void io_uring_cmd_complete_in_task(struct io_uring_cmd *ioucmd,
 +			void (*driver_cb)(struct io_uring_cmd *));
  struct sock *io_uring_get_socket(struct file *file);
- void __io_uring_cancel(struct files_struct *files);
+ void __io_uring_cancel(bool cancel_all);
  void __io_uring_free(struct task_struct *tsk);
-@@ -41,6 +45,10 @@ static inline void io_uring_free(struct task_struct *tsk)
+@@ -42,6 +46,10 @@ static inline void io_uring_free(struct task_struct *tsk)
  static inline void io_uring_cmd_done(struct io_uring_cmd *cmd, ssize_t ret)
  {
  }

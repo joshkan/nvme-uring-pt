@@ -1,0 +1,142 @@
+From b087a54375559496de61b3bc9e93cdb588a14da4 Mon Sep 17 00:00:00 2001
+From: Kanchan Joshi <joshi.k@samsung.com>
+Date: Mon, 25 Oct 2021 17:22:30 +0530
+Subject: [PATCH v6 19/21] nvme: enable bio-cache for fixed-buffer passthru
+
+Since we do submission/completion in task, we can have this up.
+Add a bio-set for nvme as we need that for bio-cache.
+
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ block/blk-map.c           | 4 ++--
+ drivers/nvme/host/core.c  | 9 +++++++++
+ drivers/nvme/host/ioctl.c | 6 ++++--
+ drivers/nvme/host/nvme.h  | 1 +
+ include/linux/blk-mq.h    | 2 +-
+ 5 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/block/blk-map.c b/block/blk-map.c
+index 9aa9864eab55..e3e28b628fba 100644
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -580,7 +580,7 @@ EXPORT_SYMBOL(blk_rq_map_user);
+ 
+ /* Unlike blk_rq_map_user () this is only for fixed-buffer async passthrough. */
+ int blk_rq_map_user_fixedb(struct request_queue *q, struct request *rq,
+-		     u64 ubuf, unsigned long len, gfp_t gfp_mask,
++		     u64 ubuf, unsigned long len, struct bio_set *bs,
+ 		     struct io_uring_cmd *ioucmd)
+ {
+ 	struct iov_iter iter;
+@@ -604,7 +604,7 @@ int blk_rq_map_user_fixedb(struct request_queue *q, struct request *rq,
+ 	if (nr_segs > queue_max_segments(q))
+ 		return -EINVAL;
+ 	/* no iovecs to alloc, as we already have a BVEC iterator */
+-	bio = bio_alloc(gfp_mask, 0);
++	bio = bio_from_cache(0, bs);
+ 	if (!bio)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index a0cb1b1e7eae..5a3b174ada2b 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -30,6 +30,9 @@
+ 
+ #define NVME_MINORS		(1U << MINORBITS)
+ 
++#define NVME_BIO_POOL_SZ	(4)
++struct bio_set nvme_bio_pool;
++
+ unsigned int admin_timeout = 60;
+ module_param(admin_timeout, uint, 0644);
+ MODULE_PARM_DESC(admin_timeout, "timeout in seconds for admin commands");
+@@ -4757,6 +4760,11 @@ static int __init nvme_core_init(void)
+ 		goto unregister_generic_ns;
+ 	}
+ 
++	result = bioset_init(&nvme_bio_pool, NVME_BIO_POOL_SZ, 0,
++			BIOSET_NEED_BVECS | BIOSET_PERCPU_CACHE);
++	if (result < 0)
++		goto unregister_generic_ns;
++
+ 	return 0;
+ 
+ unregister_generic_ns:
+@@ -4779,6 +4787,7 @@ static int __init nvme_core_init(void)
+ 
+ static void __exit nvme_core_exit(void)
+ {
++	bioset_exit(&nvme_bio_pool);
+ 	class_destroy(nvme_ns_chr_class);
+ 	class_destroy(nvme_subsys_class);
+ 	class_destroy(nvme_class);
+diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
+index afeb3afe6c60..f80e26095f20 100644
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -43,6 +43,7 @@ static void nvme_pt_task_cb(struct io_uring_cmd *ioucmd)
+ 	struct request *req = cmd->req;
+ 	int status;
+ 	u64 result;
++	struct bio *bio = req->bio;
+ 
+ 	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
+ 		status = -EINTR;
+@@ -52,6 +53,7 @@ static void nvme_pt_task_cb(struct io_uring_cmd *ioucmd)
+ 
+ 	/* we can free request */
+ 	blk_mq_free_request(req);
++	blk_rq_unmap_user(bio);
+ 
+ 	if (cmd->meta) {
+ 		if (status)
+@@ -73,9 +75,9 @@ static void nvme_end_async_pt(struct request *req, blk_status_t err)
+ 	struct bio *bio = cmd->bio;
+ 
+ 	cmd->req = req;
++	req->bio = bio;
+ 	/* this takes care of setting up task-work */
+ 	io_uring_cmd_complete_in_task(ioucmd, nvme_pt_task_cb);
+-	blk_rq_unmap_user(bio);
+ }
+ 
+ static void nvme_setup_uring_cmd_data(struct request *rq,
+@@ -164,7 +166,7 @@ static int nvme_submit_user_cmd(struct request_queue *q,
+ 					bufflen, GFP_KERNEL);
+ 		else
+ 			ret = blk_rq_map_user_fixedb(q, req, ubuffer, bufflen,
+-					GFP_KERNEL, ioucmd);
++					&nvme_bio_pool, ioucmd);
+ 		if (ret)
+ 			goto out;
+ 		bio = req->bio;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 90b0c298381a..f24c86249f1a 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -47,6 +47,7 @@ extern unsigned int admin_timeout;
+ extern struct workqueue_struct *nvme_wq;
+ extern struct workqueue_struct *nvme_reset_wq;
+ extern struct workqueue_struct *nvme_delete_wq;
++extern struct bio_set nvme_bio_pool;
+ 
+ /*
+  * List of workarounds for devices that required behavior not specified in
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 8d7b101bb22d..4f53eb1d31c6 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -918,7 +918,7 @@ struct rq_map_data {
+ int blk_rq_map_user(struct request_queue *, struct request *,
+ 		struct rq_map_data *, void __user *, unsigned long, gfp_t);
+ int blk_rq_map_user_fixedb(struct request_queue *, struct request *,
+-		     u64 ubuf, unsigned long, gfp_t,
++		     u64 ubuf, unsigned long, struct bio_set *,
+ 		     struct io_uring_cmd *);
+ int blk_rq_map_user_iov(struct request_queue *, struct request *,
+ 		struct rq_map_data *, const struct iov_iter *, gfp_t);
+-- 
+2.25.1
+

@@ -1,0 +1,201 @@
+From ad8ac19de184d919b6d6aa04f3ce5e9c1bc0a87b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 8 Nov 2021 12:16:26 +0530
+Subject: [PATCH v6 02/21] io_uring: add infrastructure around io_uring_cmd_sqe
+ issue type
+
+Define an io_uring_cmd_sqe struct that passthrough commands can use,
+and define an array that has offset information for the two members
+that we care about (user_data and personality). Then we can init the
+two command types in basically the same way, just reading the user_data
+and personality at the defined offsets for the command type.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/io_uring.c                 | 57 ++++++++++++++++++++++++++++-------
+ include/uapi/linux/io_uring.h | 10 ++++++
+ 2 files changed, 56 insertions(+), 11 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 3e793eff3af8..0fe7a9fc9fa0 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -896,6 +896,22 @@ struct io_defer_entry {
+ 	u32			seq;
+ };
+ 
++struct sqe_offset {
++	unsigned char		user_data;
++	unsigned char		personality;
++};
++
++static struct sqe_offset sqe_offsets[] = {
++	{
++		.user_data	= offsetof(struct io_uring_sqe, user_data),
++		.personality	= offsetof(struct io_uring_sqe, personality)
++	},
++	{
++		.user_data	= offsetof(struct io_uring_cmd_sqe, user_data),
++		.personality	= offsetof(struct io_uring_cmd_sqe, personality)
++	}
++};
++
+ struct io_op_def {
+ 	/* needs req->file assigned */
+ 	unsigned		needs_file : 1;
+@@ -918,6 +934,8 @@ struct io_op_def {
+ 	unsigned		audit_skip : 1;
+ 	/* size of async data needed, if any */
+ 	unsigned short		async_size;
++	/* offset definition for user_data/personality */
++	unsigned short		offsets;
+ };
+ 
+ static const struct io_op_def io_op_defs[] = {
+@@ -1096,6 +1114,9 @@ static const struct io_op_def io_op_defs[] = {
+ 	[IORING_OP_MKDIRAT] = {},
+ 	[IORING_OP_SYMLINKAT] = {},
+ 	[IORING_OP_LINKAT] = {},
++	[IORING_OP_URING_CMD] = {
++		.offsets		= 1,
++	},
+ };
+ 
+ /* requests with any of those set should undergo io_disarm_next() */
+@@ -7061,18 +7082,20 @@ static void io_init_req_drain(struct io_kiocb *req)
+ }
+ 
+ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+-		       const struct io_uring_sqe *sqe)
++		       const struct io_uring_sqe *sqe, const struct io_uring_sqe_hdr *hdr)
+ 	__must_hold(&ctx->uring_lock)
+ {
++	const struct io_op_def *def;
+ 	unsigned int sqe_flags;
+ 	int personality;
++	const __u64 *uptr;
++	const __u16 *pptr;
+ 	u8 opcode;
+ 
+ 	/* req is partially pre-initialised, see io_preinit_req() */
+-	req->opcode = opcode = READ_ONCE(sqe->hdr.opcode);
++	req->opcode = opcode = READ_ONCE(hdr->opcode);
+ 	/* same numerical values with corresponding REQ_F_*, safe to copy */
+-	req->flags = sqe_flags = READ_ONCE(sqe->hdr.flags);
+-	req->user_data = READ_ONCE(sqe->user_data);
++	req->flags = sqe_flags = READ_ONCE(hdr->flags);
+ 	req->file = NULL;
+ 	req->fixed_rsrc_refs = NULL;
+ 	req->task = current;
+@@ -7081,12 +7104,12 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 		req->opcode = 0;
+ 		return -EINVAL;
+ 	}
++	def = &io_op_defs[req->opcode];
+ 	if (unlikely(sqe_flags & ~SQE_COMMON_FLAGS)) {
+ 		/* enforce forwards compatibility on users */
+ 		if (sqe_flags & ~SQE_VALID_FLAGS)
+ 			return -EINVAL;
+-		if ((sqe_flags & IOSQE_BUFFER_SELECT) &&
+-		    !io_op_defs[opcode].buffer_select)
++		if ((sqe_flags & IOSQE_BUFFER_SELECT) && !def->buffer_select)
+ 			return -EOPNOTSUPP;
+ 		if (sqe_flags & IOSQE_IO_DRAIN)
+ 			io_init_req_drain(req);
+@@ -7105,26 +7128,30 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 		}
+ 	}
+ 
+-	if (io_op_defs[opcode].needs_file) {
++	if (def->needs_file) {
+ 		struct io_submit_state *state = &ctx->submit_state;
+ 
+ 		/*
+ 		 * Plug now if we have more than 2 IO left after this, and the
+ 		 * target is potentially a read/write to block based storage.
+ 		 */
+-		if (state->need_plug && io_op_defs[opcode].plug) {
++		if (state->need_plug && def->plug) {
+ 			state->plug_started = true;
+ 			state->need_plug = false;
+ 			blk_start_plug_nr_ios(&state->plug, state->submit_nr);
+ 		}
+ 
+-		req->file = io_file_get(ctx, req, READ_ONCE(sqe->hdr.fd),
++		req->file = io_file_get(ctx, req, READ_ONCE(hdr->fd),
+ 					(sqe_flags & IOSQE_FIXED_FILE));
+ 		if (unlikely(!req->file))
+ 			return -EBADF;
+ 	}
+ 
+-	personality = READ_ONCE(sqe->personality);
++	uptr = (const void *) hdr + sqe_offsets[def->offsets].user_data;
++	req->user_data = READ_ONCE(*uptr);
++
++	pptr = (const void *) hdr + sqe_offsets[def->offsets].personality;
++	personality = READ_ONCE(*pptr);
+ 	if (personality) {
+ 		int ret;
+ 
+@@ -7150,7 +7177,7 @@ static int io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 	struct io_submit_link *link = &ctx->submit_state.link;
+ 	int ret;
+ 
+-	ret = io_init_req(ctx, req, sqe);
++	ret = io_init_req(ctx, req, sqe, &sqe->hdr);
+ 	if (unlikely(ret)) {
+ 		trace_io_uring_req_failed(sqe, ret);
+ 
+@@ -11073,6 +11100,7 @@ static int __init io_uring_init(void)
+ #define BUILD_BUG_SQE_ELEM(eoffset, etype, ename) \
+ 	__BUILD_BUG_VERIFY_ELEMENT(struct io_uring_sqe, eoffset, etype, ename)
+ 	BUILD_BUG_ON(sizeof(struct io_uring_sqe) != 64);
++	BUILD_BUG_ON(sizeof(struct io_uring_cmd_sqe) != 64);
+ 	BUILD_BUG_SQE_ELEM(0,  __u8,   hdr.opcode);
+ 	BUILD_BUG_SQE_ELEM(1,  __u8,   hdr.flags);
+ 	BUILD_BUG_SQE_ELEM(2,  __u16,  hdr.ioprio);
+@@ -11104,6 +11132,13 @@ static int __init io_uring_init(void)
+ 	BUILD_BUG_SQE_ELEM(44, __s32,  splice_fd_in);
+ 	BUILD_BUG_SQE_ELEM(44, __u32,  file_index);
+ 
++#define BUILD_BUG_SQEC_ELEM(eoffset, etype, ename) \
++	__BUILD_BUG_VERIFY_ELEMENT(struct io_uring_cmd_sqe, eoffset, etype, ename)
++	BUILD_BUG_SQEC_ELEM(8,				__u64,	user_data);
++	BUILD_BUG_SQEC_ELEM(18,				__u16,	personality);
++	BUILD_BUG_SQEC_ELEM(sqe_offsets[1].user_data,	__u64,	user_data);
++	BUILD_BUG_SQEC_ELEM(sqe_offsets[1].personality,	__u16,	personality);
++
+ 	BUILD_BUG_ON(sizeof(struct io_uring_files_update) !=
+ 		     sizeof(struct io_uring_rsrc_update));
+ 	BUILD_BUG_ON(sizeof(struct io_uring_rsrc_update) >
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 4432c41e68bd..731ca6f6b06f 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -74,6 +74,15 @@ struct io_uring_sqe {
+ 	__u64	__pad2[2];
+ };
+ 
++struct io_uring_cmd_sqe {
++	struct io_uring_sqe_hdr	hdr;
++	__u64			user_data;
++	__u16			op;
++	__u16			personality;
++	__u32			len;
++	__u64			pdu[5];
++};
++
+ enum {
+ 	IOSQE_FIXED_FILE_BIT,
+ 	IOSQE_IO_DRAIN_BIT,
+@@ -151,6 +160,7 @@ enum {
+ 	IORING_OP_MKDIRAT,
+ 	IORING_OP_SYMLINKAT,
+ 	IORING_OP_LINKAT,
++	IORING_OP_URING_CMD,
+ 
+ 	/* this goes last, obviously */
+ 	IORING_OP_LAST,
+-- 
+2.25.1
+

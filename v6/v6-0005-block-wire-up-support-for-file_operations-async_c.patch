@@ -1,0 +1,107 @@
+From e91063ac351623ffe57ebb6292c9b3054c28ea6b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 25 Oct 2021 13:55:01 +0530
+Subject: [PATCH v6 05/21] block: wire up support for
+ file_operations->async_cmd()
+
+Pass it through the mq_ops->async_cmd() handler, so we can plumb it
+through all the way to the device driver.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-mq.c         | 11 +++++++++++
+ block/fops.c           | 10 ++++++++++
+ include/linux/blk-mq.h |  6 ++++++
+ include/linux/blkdev.h |  2 ++
+ 4 files changed, 29 insertions(+)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 629cf421417f..d8bd6957f342 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4388,6 +4388,17 @@ int blk_mq_poll(struct request_queue *q, blk_qc_t cookie, struct io_comp_batch *
+ 	return blk_mq_poll_classic(q, cookie, iob, flags);
+ }
+ 
++int blk_async_cmd(struct block_device *bdev, struct io_uring_cmd *cmd,
++		  enum io_uring_cmd_flags issue_flags)
++{
++	struct request_queue *q = bdev_get_queue(bdev);
++
++	if (!q->mq_ops || !q->mq_ops->async_cmd)
++		return -EOPNOTSUPP;
++
++	return q->mq_ops->async_cmd(q, cmd, issue_flags);
++}
++
+ unsigned int blk_mq_rq_cpu(struct request *rq)
+ {
+ 	return rq->mq_ctx->cpu;
+diff --git a/block/fops.c b/block/fops.c
+index ad732a36f9b3..89d7b8fc7bc8 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -15,6 +15,7 @@
+ #include <linux/falloc.h>
+ #include <linux/suspend.h>
+ #include <linux/fs.h>
++#include <linux/io_uring.h>
+ #include "blk.h"
+ 
+ static inline struct inode *bdev_file_inode(struct file *file)
+@@ -141,6 +142,14 @@ struct blkdev_dio {
+ 
+ static struct bio_set blkdev_dio_pool;
+ 
++static int blkdev_async_cmd(struct io_uring_cmd *cmd,
++			    enum io_uring_cmd_flags flags)
++{
++	struct block_device *bdev = I_BDEV(cmd->file->f_mapping->host);
++
++	return blk_async_cmd(bdev, cmd, flags);
++}
++
+ static void blkdev_bio_end_io(struct bio *bio)
+ {
+ 	struct blkdev_dio *dio = bio->bi_private;
+@@ -670,6 +679,7 @@ const struct file_operations def_blk_fops = {
+ 	.splice_read	= generic_file_splice_read,
+ 	.splice_write	= iter_file_splice_write,
+ 	.fallocate	= blkdev_fallocate,
++	.async_cmd	= blkdev_async_cmd,
+ };
+ 
+ static __init int blkdev_init(void)
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 2949d9ac7484..a826621078b4 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -583,6 +583,12 @@ struct blk_mq_ops {
+ 	 */
+ 	int (*map_queues)(struct blk_mq_tag_set *set);
+ 
++	/**
++	 * @async_cmd: queues requests through io_uring IORING_OP_URING_CMD
++	 */
++	int (*async_cmd)(struct request_queue *q, struct io_uring_cmd *cmd,
++				enum io_uring_cmd_flags issue_flags);
++
+ #ifdef CONFIG_BLK_DEBUG_FS
+ 	/**
+ 	 * @show_rq: Used by the debugfs implementation to show driver-specific
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index bd4370baccca..18caf2cd56ed 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -612,6 +612,8 @@ blk_status_t errno_to_blk_status(int errno);
+ int bio_poll(struct bio *bio, struct io_comp_batch *iob, unsigned int flags);
+ int iocb_bio_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
+ 			unsigned int flags);
++int blk_async_cmd(struct block_device *bdev, struct io_uring_cmd *cmd,
++			enum io_uring_cmd_flags issue_flags);
+ 
+ static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
+ {
+-- 
+2.25.1
+

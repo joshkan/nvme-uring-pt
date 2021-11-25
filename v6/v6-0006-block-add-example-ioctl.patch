@@ -1,0 +1,110 @@
+From 8acb7d6cc969aa3e2d54bcc2fa3ef29b20d8495c Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 25 Oct 2021 14:03:45 +0530
+Subject: [PATCH v6 06/21] block: add example ioctl
+
+Grab op == 1, BLOCK_URING_OP_IOCTL, and use it to implement basic
+ioctl functionality.
+
+Example code, to issue BLKBSZGET through IORING_OP_URING_CMD:
+
+struct block_uring_cmd {
+        __u32   ioctl_cmd;
+        __u32   unused1;
+        __u64   unused2[4];
+};
+
+static int get_bs(struct io_uring *ring, const char *dev)
+{
+        struct io_uring_cqe *cqe;
+        struct io_uring_sqe *sqe;
+        struct io_uring_cmd_sqe *csqe;
+        struct block_uring_cmd *cmd;
+        int ret, fd;
+
+        fd = open(dev, O_RDONLY);
+
+        sqe = io_uring_get_sqe(ring);
+        csqe = (void *) sqe;
+        memset(csqe, 0, sizeof(*csqe));
+        csqe->hdr.opcode = IORING_OP_URING_CMD;
+        csqe->hdr.fd = fd;
+        csqe->user_data = 0x1234;
+        csqe->op = BLOCK_URING_OP_IOCTL;
+
+        io_uring_submit(ring);
+        io_uring_wait_cqe(ring, &cqe);
+        printf("bs=%d\n", cqe->res);
+        io_uring_cqe_seen(ring, cqe);
+        return 0;
+err:
+        return 1;
+}
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/fops.c           | 20 ++++++++++++++++++++
+ include/linux/blkdev.h | 11 +++++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/block/fops.c b/block/fops.c
+index 89d7b8fc7bc8..3a63b4d02179 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -142,11 +142,31 @@ struct blkdev_dio {
+ 
+ static struct bio_set blkdev_dio_pool;
+ 
++static int blkdev_async_ioctl(struct block_device *bdev,
++			      struct io_uring_cmd *cmd)
++{
++	struct block_uring_cmd *bcmd = (struct block_uring_cmd *) &cmd->pdu;
++
++	switch (bcmd->ioctl_cmd) {
++	case BLKBSZGET:
++		return block_size(bdev);
++	default:
++		return -ENOTTY;
++	}
++}
++
+ static int blkdev_async_cmd(struct io_uring_cmd *cmd,
+ 			    enum io_uring_cmd_flags flags)
+ {
+ 	struct block_device *bdev = I_BDEV(cmd->file->f_mapping->host);
+ 
++	switch (cmd->op) {
++	case BLOCK_URING_OP_IOCTL:
++		return blkdev_async_ioctl(bdev, cmd);
++	default:
++		break;
++	}
++
+ 	return blk_async_cmd(bdev, cmd, flags);
+ }
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 18caf2cd56ed..f38e80bf2be7 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -32,6 +32,17 @@ struct blk_queue_stats;
+ struct blk_stat_callback;
+ struct blk_crypto_profile;
+ 
++enum {
++	BLOCK_URING_OP_IOCTL = 1,
++};
++
++/* This overlays struct io_uring_cmd pdu (40 bytes) */
++struct block_uring_cmd {
++	__u32	ioctl_cmd;
++	__u32	unused1;
++	__u64	unused2[4];
++};
++
+ /* Must be consistent with blk_mq_poll_stats_bkt() */
+ #define BLK_MQ_POLL_STATS_BKTS 16
+ 
+-- 
+2.25.1
+

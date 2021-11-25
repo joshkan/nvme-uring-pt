@@ -1,0 +1,93 @@
+From c424fcf68d394113c4731d78cf5f561576b2c40b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 25 Oct 2021 17:03:45 +0530
+Subject: [PATCH v6 17/21] block: wire-up support for plugging
+
+Add support to use plugging if it is enabled, else use default path.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-mq.c | 52 +++++++++++++++++++++++++++-----------------------
+ 1 file changed, 28 insertions(+), 24 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index d8bd6957f342..6106ee8060b8 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2144,6 +2144,21 @@ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+ 	blk_mq_hctx_mark_pending(hctx, ctx);
+ }
+ 
++static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
++{
++	if (!plug->multiple_queues) {
++		struct request *nxt = rq_list_peek(&plug->mq_list);
++
++		if (nxt && nxt->q != rq->q)
++			plug->multiple_queues = true;
++	}
++	if (!plug->has_elevator && (rq->rq_flags & RQF_ELV))
++		plug->has_elevator = true;
++	rq->rq_next = NULL;
++	rq_list_add(&plug->mq_list, rq);
++	plug->rq_count++;
++}
++
+ /**
+  * blk_mq_request_bypass_insert - Insert a request at dispatch list.
+  * @rq: Pointer to request to be inserted.
+@@ -2157,16 +2172,20 @@ void blk_mq_request_bypass_insert(struct request *rq, bool at_head,
+ 				  bool run_queue)
+ {
+ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
++	struct blk_plug *plug = current->plug;
+ 
+-	spin_lock(&hctx->lock);
+-	if (at_head)
+-		list_add(&rq->queuelist, &hctx->dispatch);
+-	else
+-		list_add_tail(&rq->queuelist, &hctx->dispatch);
+-	spin_unlock(&hctx->lock);
+-
+-	if (run_queue)
+-		blk_mq_run_hw_queue(hctx, false);
++	if (plug) {
++		blk_add_rq_to_plug(plug, rq);
++	} else {
++		spin_lock(&hctx->lock);
++		if (at_head)
++			list_add(&rq->queuelist, &hctx->dispatch);
++		else
++			list_add_tail(&rq->queuelist, &hctx->dispatch);
++		spin_unlock(&hctx->lock);
++		if (run_queue)
++			blk_mq_run_hw_queue(hctx, false);
++	}
+ }
+ 
+ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+@@ -2468,21 +2487,6 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+ 		hctx->queue->mq_ops->commit_rqs(hctx);
+ }
+ 
+-static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
+-{
+-	if (!plug->multiple_queues) {
+-		struct request *nxt = rq_list_peek(&plug->mq_list);
+-
+-		if (nxt && nxt->q != rq->q)
+-			plug->multiple_queues = true;
+-	}
+-	if (!plug->has_elevator && (rq->rq_flags & RQF_ELV))
+-		plug->has_elevator = true;
+-	rq->rq_next = NULL;
+-	rq_list_add(&plug->mq_list, rq);
+-	plug->rq_count++;
+-}
+-
+ /*
+  * Allow 2x BLK_MAX_REQUEST_COUNT requests on plug queue for multiple
+  * queues. This is important for md arrays to benefit from merging
+-- 
+2.25.1
+
